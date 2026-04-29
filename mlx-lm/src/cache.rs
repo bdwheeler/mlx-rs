@@ -90,12 +90,24 @@ impl ConcatKeyValueCache {
             self.offset = 0;
             return;
         }
-        // K/V shape: [n_kv_heads, seq_len, head_dim]; slice axis -2 (seq_len).
+        // Slice the seq_len axis (-2). qwen3/llama store K/V as 4D
+        // [B, n_kv_heads, seq_len, head_dim] after the [0,2,1,3] transpose;
+        // 3D [n_kv_heads, seq_len, head_dim] is also possible for caches built
+        // outside the model. Dispatch on rank — mlx-rs's index tuples are
+        // length-fixed and a 3-axis tuple silently slices the wrong axis on
+        // a 4D array.
+        let trim = |a: &Array, new_offset: i32| -> Array {
+            match a.shape().len() {
+                3 => a.index((.., ..new_offset, ..)),
+                4 => a.index((.., .., ..new_offset, ..)),
+                r => panic!("ConcatKeyValueCache::trim_to: unsupported KV rank {r}"),
+            }
+        };
         if let Some(k) = self.keys.as_ref() {
-            self.keys = Some(k.index((.., ..new_offset, ..)));
+            self.keys = Some(trim(k, new_offset));
         }
         if let Some(v) = self.values.as_ref() {
-            self.values = Some(v.index((.., ..new_offset, ..)));
+            self.values = Some(trim(v, new_offset));
         }
         self.offset = new_offset;
     }
