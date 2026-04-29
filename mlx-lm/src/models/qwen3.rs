@@ -127,7 +127,11 @@ impl Attention {
 // TODO: check if this input can be generic for other attention modules
 pub struct AttentionInput<'a, C> {
     pub x: &'a Array,
-    pub mask: Option<&'a Array>,
+    /// Attention mask for SDPA. `Causal` is the common case at prefill (T>1)
+    /// and dispatches to MLX's specialized causal kernel — matches Python
+    /// mlx_lm's `mask="causal"` path. `Array` is for explicit user-provided
+    /// masks. `None` is the decode (T=1) case.
+    pub mask: Option<mlx_rs::fast::ScaledDotProductAttentionMask<'a>>,
     pub cache: Option<&'a mut C>,
 }
 
@@ -151,16 +155,14 @@ where
         let keys = self.k_proj.forward(x)?;
         let values = self.v_proj.forward(x)?;
 
-        let mut queries = self.q_norm.forward(
-            &queries
-                .reshape(&[B, L, self.n_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?,
-        )?;
-        let mut keys = self.k_norm.forward(
-            &keys
-                .reshape(&[B, L, self.n_kv_heads, -1])?
-                .transpose_axes(&[0, 2, 1, 3])?,
-        )?;
+        let mut queries = self
+            .q_norm
+            .forward(&queries.reshape(&[B, L, self.n_heads, -1])?)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let mut keys = self
+            .k_norm
+            .forward(&keys.reshape(&[B, L, self.n_kv_heads, -1])?)?
+            .transpose_axes(&[0, 2, 1, 3])?;
         let mut values = values
             .reshape(&[B, L, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
@@ -397,15 +399,16 @@ where
 
         let mut h = self.embed_tokens.forward(inputs)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only `Array` mask is supported"));
-                }
-                None => None,
-            },
+        // Compute the attention mask once. If the caller provided one, wrap as
+        // `Array`. Otherwise use `create_attention_mask` and let it decide between
+        // a materialized array (for sliding-window cases) or `Causal` (the common
+        // prefill path). The Causal variant routes to MLX's specialized causal
+        // kernel — matches Python mlx_lm's `mask="causal"` path. Forcing an array
+        // mask here (the prior behavior) routed every prefill through the general
+        // masked-attention kernel and produced subtly-different bf16 logits.
+        let owned_mask: Option<AttentionMask> = match mask {
+            Some(m) => Some(AttentionMask::Array(m.clone())),
+            None => create_attention_mask(&h, cache, None)?,
         };
 
         if cache.is_empty() {
@@ -415,7 +418,9 @@ where
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
             let layer_input = AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: owned_mask
+                    .as_ref()
+                    .map(mlx_rs::fast::ScaledDotProductAttentionMask::from),
                 cache: c.as_mut(),
             };
             h = layer.forward(layer_input)?;

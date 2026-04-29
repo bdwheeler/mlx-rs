@@ -119,9 +119,12 @@ where
 
     fn forward(&mut self, input: Input) -> Result<Self::Output, Self::Error> {
         let RopeInput { x, offset } = input.into();
-        let shape = x.shape();
-        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)])?;
-        let x = crate::fast::rope(
+        // Pass the input shape through to fast::rope as-is. The earlier reshape
+        // to 3D ([B*H, L, D]) caused divergence vs Python mlx — the rope kernel
+        // produces different rotations when the head dim is collapsed into a
+        // batch axis (verified by saving Q/K post-rope: bit-identical pre-rope,
+        // diff L2=64 post-rope at head 1+, fix matches Python bit-for-bit).
+        crate::fast::rope(
             x,
             self.dimensions,
             self.traditional,
@@ -129,8 +132,7 @@ where
             self.scale,
             offset,
             None,
-        )?;
-        x.reshape(shape)
+        )
     }
 
     fn training_mode(&mut self, _mode: bool) {}

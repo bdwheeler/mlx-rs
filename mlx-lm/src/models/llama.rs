@@ -169,7 +169,12 @@ where
         }
 
         let output = crate::utils::scaled_dot_product_attention(
-            queries, keys, values, cache, self.scale, mask,
+            queries,
+            keys,
+            values,
+            cache,
+            self.scale,
+            mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[B, L, -1])?;

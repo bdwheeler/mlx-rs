@@ -190,13 +190,13 @@ impl From<QuantizedValues> for MaybeQuantizedValues {
     }
 }
 
-pub(crate) fn scaled_dot_product_attention<C>(
+pub(crate) fn scaled_dot_product_attention<'a, C>(
     queries: Array,
     keys: impl Into<MaybeQuantizedKeys>,
     values: impl Into<MaybeQuantizedValues>,
     cache: Option<C>,
     scale: f32,
-    mask: Option<&Array>,
+    mask: Option<ScaledDotProductAttentionMask<'a>>,
 ) -> Result<Array, Exception>
 where
     C: KeyValueCache,
@@ -224,8 +224,25 @@ where
                 }
             };
 
+            // The quantized SDPA path doesn't have a Causal-mode kernel, so we
+            // materialize a causal array mask for it.
+            let mask_array_owner;
+            let mask_array_ref: Option<&Array> = match mask {
+                None => None,
+                Some(ScaledDotProductAttentionMask::Array(a)) => Some(a),
+                Some(ScaledDotProductAttentionMask::Causal) => {
+                    let q_shape = queries.shape();
+                    let q_seq = q_shape[q_shape.len() - 2];
+                    let k_shape = keys.keys.shape();
+                    let k_seq = k_shape[k_shape.len() - 2];
+                    let offset = k_seq - q_seq;
+                    mask_array_owner = create_causal_mask(q_seq, Some(offset), None, None)?;
+                    Some(&mask_array_owner)
+                }
+            };
+
             return quantized_scaled_dot_product_attention(
-                queries, keys, values, scale, mask, group_size, bits,
+                queries, keys, values, scale, mask_array_ref, group_size, bits,
             );
         }
     }
@@ -241,14 +258,7 @@ where
         }
     };
 
-    mlx_rs::fast::scaled_dot_product_attention(
-        queries,
-        keys,
-        values,
-        scale,
-        mask.map(ScaledDotProductAttentionMask::Array),
-        None,
-    )
+    mlx_rs::fast::scaled_dot_product_attention(queries, keys, values, scale, mask, None)
 }
 
 #[derive(Debug, Clone)]

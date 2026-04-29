@@ -1,4 +1,4 @@
-use mlx_rs::{error::Exception, ops::concatenate_axis, Array};
+use mlx_rs::{error::Exception, ops::concatenate_axis, transforms::eval, Array};
 
 // TODO: somehow move quantized methods to a separate trait?
 pub trait KeyValueCache {
@@ -57,6 +57,10 @@ where
     }
 }
 
+/// KV cache backed by concatenation: each call to `update_and_fetch` builds a
+/// fresh contiguous K/V tensor by concatenating the new K/V with the existing.
+/// Returns the concatenated tensor directly (which is contiguous because
+/// concatenate produces a fresh array).
 #[derive(Debug, Clone, Default)]
 pub struct ConcatKeyValueCache {
     keys: Option<Array>,
@@ -67,6 +71,33 @@ pub struct ConcatKeyValueCache {
 impl ConcatKeyValueCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Trim the cache to retain only the first `new_offset` positions along the
+    /// sequence axis. Used after tree-shaped speculative verification to discard
+    /// KV state for rejected draft branches, leaving only the accepted prefix.
+    ///
+    /// No-op if `new_offset >= self.offset`. Setting `new_offset <= 0` clears the
+    /// cache entirely.
+    pub fn trim_to(&mut self, new_offset: i32) {
+        use mlx_rs::ops::indexing::IndexOp;
+        if new_offset >= self.offset {
+            return;
+        }
+        if new_offset <= 0 {
+            self.keys = None;
+            self.values = None;
+            self.offset = 0;
+            return;
+        }
+        // K/V shape: [n_kv_heads, seq_len, head_dim]; slice axis -2 (seq_len).
+        if let Some(k) = self.keys.as_ref() {
+            self.keys = Some(k.index((.., ..new_offset, ..)));
+        }
+        if let Some(v) = self.values.as_ref() {
+            self.values = Some(v.index((.., ..new_offset, ..)));
+        }
+        self.offset = new_offset;
     }
 }
 
@@ -88,18 +119,21 @@ impl KeyValueCache for ConcatKeyValueCache {
             (Some(k), Some(v)) => {
                 self.keys = Some(concatenate_axis(&[k, keys], -2)?);
                 self.values = Some(concatenate_axis(&[v, values], -2)?);
+                eval(std::slice::from_ref(self.keys.as_ref().unwrap()))
+                    .map_err(|e| Exception::custom(format!("eval KV keys: {e}")))?;
+                eval(std::slice::from_ref(self.values.as_ref().unwrap()))
+                    .map_err(|e| Exception::custom(format!("eval KV values: {e}")))?;
             }
             _ => {
                 self.keys = Some(keys);
                 self.values = Some(values);
             }
         }
-        let shape = self.keys.as_ref().expect("Keys cannot be None").shape();
+        let shape = self.keys.as_ref().unwrap().shape();
         self.offset = shape[shape.len() - 2];
-
         Ok((
-            self.keys.clone().expect("Keys cannot be None"),
-            self.values.clone().expect("Values cannot be None"),
+            self.keys.clone().unwrap(),
+            self.values.clone().unwrap(),
         ))
     }
 }
