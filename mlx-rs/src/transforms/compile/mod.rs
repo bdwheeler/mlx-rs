@@ -146,6 +146,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::{Closure, Guarded, VectorArray};
+use crate::error::Exception;
 use crate::Array;
 
 #[allow(clippy::module_inception)]
@@ -218,5 +219,89 @@ fn update_by_replace_with_ref_to_new_array(src: &mut Array, new_array: &Array) {
     debug_assert_eq!(src.shape(), new_array.shape());
     unsafe {
         mlx_sys::mlx_array_set(&mut src.as_ptr() as *mut _, new_array.as_ptr());
+    }
+}
+
+/// Compiled function state that caches the FFI closure for its full lifetime.
+///
+/// Unlike [`CompiledState`] (which rebuilds the [`Closure`] on every call),
+/// this type builds the closure once at construction — the function `F` is
+/// moved into the closure and owned by the C side. Reuse the same
+/// `CompiledCached` across calls to avoid per-call `Box` + FFI overhead.
+#[derive(Debug)]
+pub struct CompiledCached {
+    closure: Closure<'static>,
+    shapeless: bool,
+    id: usize,
+}
+
+// SAFETY: The inner mlx_closure handle is a C pointer to an MLX compiled
+// function. MLX's C API uses its own stream-level synchronisation; the handle
+// can safely be sent between threads.
+unsafe impl Send for CompiledCached {}
+
+impl CompiledCached {
+    pub(crate) fn new_infallible<F>(f: F, shapeless: bool, id: usize) -> Self
+    where
+        F: FnMut(&[Array]) -> Vec<Array> + 'static,
+    {
+        Self {
+            closure: Closure::new(f),
+            shapeless,
+            id,
+        }
+    }
+
+    pub(crate) fn new_fallible<F>(f: F, shapeless: bool, id: usize) -> Self
+    where
+        F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + 'static,
+    {
+        Self {
+            closure: Closure::new_fallible(f),
+            shapeless,
+            id,
+        }
+    }
+
+    /// Construct a `CompiledCached` from a function pointer. The pointer's
+    /// address is used as the compile-cache id, so distinct functions get
+    /// distinct caches.
+    pub fn from_fn_fallible(
+        f: fn(&[Array]) -> Result<Vec<Array>, Exception>,
+        shapeless: bool,
+    ) -> Self {
+        let id = f as usize;
+        Self::new_fallible(f, shapeless, id)
+    }
+
+    /// Execute the cached compiled function.
+    pub fn call(&self, args: &[impl AsRef<Array>]) -> Result<Vec<Array>, Exception> {
+        let compiled = Closure::try_from_op(|res| unsafe {
+            let constants = &[];
+            mlx_sys::mlx_detail_compile(
+                res,
+                self.closure.as_ptr(),
+                self.id,
+                self.shapeless,
+                constants.as_ptr(),
+                0,
+            )
+        })?;
+
+        let inner_inputs_vector = VectorArray::try_from_iter(args.iter())?;
+
+        let result_vector = VectorArray::try_from_op(|res| unsafe {
+            mlx_sys::mlx_closure_apply(res, compiled.as_ptr(), inner_inputs_vector.as_ptr())
+        })?;
+
+        result_vector.try_into_values()
+    }
+}
+
+impl Drop for CompiledCached {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_detail_compile_erase(self.id);
+        }
     }
 }
